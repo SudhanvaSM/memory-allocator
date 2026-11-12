@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <errno.h>
+#include <stdbool.h>
 
 #define ALIGNMENT _Alignof(max_align_t)
 
@@ -93,25 +94,13 @@ void* sbrk_return_current_break(void) {
 }
 
 int sbrk_step(ssize_t size) {
-	if (size > 0) {
-		void *prev_break = sbrk(size);
-		if (prev_break == (void *) -1) {
-			perror("sbrk heap increase failed.\n");
-			return 1;
-		}
-		else return 0;
+	if (size == 0) return 0;
+	void *prev_break = sbrk(size);
+	if (prev_break == (void *) -1) {
+		perror("sbrk change size failed.\n");
+		return 1;
 	}
-
-	else if (size < 0) {
-		void *prev_break = sbrk(size);
-		if (prev_break == (void *) -1) {
-			perror("sbrk heap reduction failed.\n");
-			return 1;
-		}
-		else return 0;
-	}
-
-	else return 1;
+	return 0;
 }
 
 void *add_new_trailing_block(size_t remaining_size) {
@@ -254,37 +243,44 @@ void *add_used_block_best_fit(size_t size) {
 	return (void *)((char *) smallest_block + align_up(sizeof(area)));
 }
 
-void reduce_heap_size() {
+void reduce_heap_size_if_possible(void) {
 	area *last_block = find_last_block();
-	area *prev_used_block = find_previous_used_block(last_block);
-	if (!prev_used_block) {
-		if (last_block->length > PAGE_SIZE) last_block->length = PAGE_SIZE;
-		prev_used_block = last_block;
-	}
-	void *new_end = (char *)prev_used_block + align_up(sizeof(area)) + prev_used_block->length;
-	void *heap_end = sbrk_return_current_break();
+	if (last_block->in_use) return;
+
+	area* prev_used_block = find_previous_used_block(last_block);
 	my_stats *malloc_header = get_malloc_header();
-	while (new_end < heap_end - PAGE_SIZE) {
-		if (sbrk_step(-PAGE_SIZE) != 0) {
-			perror("heap reduction failed.\n");
+
+	if (!prev_used_block) {
+		size_t required_header_size = align_up(sizeof(my_stats)) + align_up(sizeof(area));
+		size_t required_payload_size = PAGE_SIZE - required_header_size;
+
+		size_t bytes_to_reduce = (last_block->length + align_up(sizeof(area)) + align_up(sizeof(my_stats))) - PAGE_SIZE;
+		if (sbrk_step(-(ssize_t)bytes_to_reduce) != 0) {
+			errno = ENOMEM;
 			return;
 		}
-		heap_end = sbrk_return_current_break();
-		malloc_header->pages -= 1;
+		last_block -> length = required_payload_size;
+		malloc_header->blocks = 1;
+		malloc_header->pages = 1;
+		return;
 	}
+	else {
+		size_t reducible = last_block->length;
+		size_t bytes_to_reduce = (reducible / PAGE_SIZE) * PAGE_SIZE;
+		
+		if (sbrk_step((ssize_t)-bytes_to_reduce) != 0) {
+			errno = ENOMEM;
+			return;
+		}
 
-	if (heap_end - new_end > align_up(sizeof(area)) + 1) {
-		area *new_not_used_block = (area *)new_end;
-		new_not_used_block->marker = BLOCK_MARKER;
-		new_not_used_block->in_use = false;
-		new_not_used_block->length = heap_end - new_end - align_up(sizeof(area));
-		new_not_used_block->next = NULL;
-		new_not_used_block->prev = prev_used_block;
-		prev_used_block->next = new_not_used_block;
+		last_block->length -= bytes_to_reduce;
+		size_t pages_released = bytes_to_reduce / PAGE_SIZE;
+		malloc_header->pages -= pages_released;
+		return;
 	}
 }
 
-int *an_malloc(ssize_t size) {
+void *an_malloc(ssize_t size) {
 	if (size <= 0) return NULL;
 	if (heap_start == NULL) {
 		heap_start = sbrk_return_current_break();
@@ -346,7 +342,6 @@ bool an_free(void *ptr) {
 		return false;
 	}
 	block->in_use = false;
-	// memset(ptr, 0, block->length);
 	if (block->next && !(block->next)->in_use) {
 		area *not_used_next_block = block->next;
 		if (not_used_next_block) {
@@ -355,7 +350,6 @@ bool an_free(void *ptr) {
 			else block->next = NULL;
 		}
 		block->length += align_up(sizeof(area)) + not_used_next_block->length;
-		// memset((void *)not_used_next_block, 0, sizeof(area) + not_used_next_block->length);
 		malloc_header->blocks -= 1;
 	}
 	if (block-> prev && !(block->prev)->in_use) {
@@ -366,7 +360,7 @@ bool an_free(void *ptr) {
 		if (block->next) block->next->prev = block;
 		malloc_header->blocks -= 1;
 	}
-	//reduce_heap_size();
+	reduce_heap_size_if_possible();
 	malloc_header->lock = false;
 	return true;
 }
@@ -528,6 +522,40 @@ void test_free() {
 	printf("Number of pages: %zu\n", malloc_header->pages);
 }
 
+void test_reduce_heap_size(void) {
+	char *ptr = (char *)an_malloc(128);
+	char *ptr1 = (char *)an_malloc(64);
+	char *ptr2 = (char *)an_malloc(256);
+	char *ptr3 = (char *)an_malloc(1024);
+
+	char *ptr4 = (char *)an_malloc(12228);
+
+	area *first_block = (area *)((char *)ptr - align_up(sizeof(area)));
+
+	printf("After allocation: ");
+	display_ll(first_block);
+	my_stats *malloc_header = get_malloc_header();
+	printf("Number of blocks: %zu\n", malloc_header->blocks);
+	printf("Number of pages: %zu\n", malloc_header->pages);
+
+	void *heap_before_free = sbrk_return_current_break();
+	an_free(ptr4);
+	void *heap_after_free = sbrk_return_current_break();
+	assert((char *)heap_before_free - (char *)heap_after_free == 3 * PAGE_SIZE);
+
+	printf("After freeing: ");
+	display_ll(first_block);
+	printf("Number of blocks: %zu\n", malloc_header->blocks);
+	printf("Number of pages: %zu\n", malloc_header->pages);
+
+	ptr4 = (char *)an_malloc(4096);
+
+	printf("After allocating again: ");
+	display_ll(first_block);
+	printf("Number of blocks: %zu\n", malloc_header->blocks);
+	printf("Number of pages: %zu\n", malloc_header->pages);
+}
+
 void call_test(void (*test_func)(), const char *msg) {
 	pid_t pid = fork();
 	if (!pid) {
@@ -545,6 +573,7 @@ void call_test(void (*test_func)(), const char *msg) {
 int main() {
 	printf("Running my Memory Allocator.\n");
 	//call_test(test_basic_malloc, "Basic Malloc");
-	call_test(test_free, "Basic Free");
+	// call_test(test_free, "Basic Free");
+	call_test(test_reduce_heap_size, "Basic Heap Reduction");
 	return 0;
 }
