@@ -572,8 +572,8 @@ void call_test(void (*test_func)(), const char *msg) {
 
 int main() {
 	printf("Running my Memory Allocator.\n");
-	//call_test(test_basic_malloc, "Basic Malloc");
-	// call_test(test_free, "Basic Free");
+	call_test(test_basic_malloc, "Basic Malloc");
+	call_test(test_free, "Basic Free");
 	call_test(test_reduce_heap_size, "Basic Heap Reduction");
 	return 0;
 }
