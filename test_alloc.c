@@ -1,7 +1,7 @@
 /*
  * test_mem_alloc.c - full test suite for the sbrk-based allocator in mem_alloc.c
  *
- * Build:   gcc -g -O0 -Wall -o bin/test_mem_alloc test_mem_alloc.c
+ * Build:   gcc -g -O0 -Wall -o bin/test_mem_alloc test_mem_alloc.c   (runs ALL tests)
  * Run:     ./bin/test_mem_alloc            (all tests)
  *          ./bin/test_mem_alloc coalesce   (only tests whose name contains "coalesce")
  *          ./bin/test_mem_alloc -l         (list tests)
@@ -32,11 +32,23 @@
 #define ALLOCATOR_SRC "mem_alloc.c"
 #endif
 
+/* realloc/calloc tests run by default. To test an allocator that lacks them, build with
+ * -DNO_REALLOC_TESTS and/or -DNO_CALLOC_TESTS. */
+#if !defined(NO_REALLOC_TESTS) && !defined(TEST_REALLOC)
+#define TEST_REALLOC
+#endif
+#if !defined(NO_CALLOC_TESTS) && !defined(TEST_CALLOC)
+#define TEST_CALLOC
+#endif
+
 #define main allocator_demo_main
 #include ALLOCATOR_SRC
 #undef main
 
 #define SKIP_EXIT 77
+#ifndef TEST_ALARM
+#define TEST_ALARM 20
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -719,6 +731,247 @@ static void t_out_of_memory(void) {
 	must_free(keep);
 }
 
+
+#ifdef TEST_REALLOC
+/* ------------------------------------------------------------------ */
+/* Tests: realloc  (build with -DTEST_REALLOC)                         */
+/* ------------------------------------------------------------------ */
+
+static void t_realloc_edge_cases(void) {
+	void *p = an_realloc(NULL, 100);
+	CHECK(p != NULL, "realloc(NULL, 100) must behave like malloc");
+	check_invariants("realloc(NULL)");
+	fill(p, 100, 1);
+	CHECK(an_realloc(p, 100) == p, "same size must return the same pointer");
+	CHECK(an_realloc(p, 97) == p, "same aligned size must return the same pointer");
+	check_invariants("same-size realloc");
+	errno = 0;
+	CHECK(an_realloc(p, -5) == NULL && errno == EINVAL, "negative size: NULL + EINVAL (errno=%d)", errno);
+	CHECK(verify(p, 100, 1), "failed realloc damaged the block");
+	check_invariants("after negative size");
+	CHECK(an_realloc(p, 0) == NULL, "realloc(p, 0) must return NULL");
+	check_baseline("after realloc(p, 0)");
+	errno = 0;
+	CHECK(an_realloc(p, 50) == NULL && errno == EINVAL, "realloc of freed pointer: NULL + EINVAL");
+	int local = 0;
+	errno = 0;
+	CHECK(an_realloc(&local, 50) == NULL && errno == EINVAL, "realloc of foreign pointer: NULL + EINVAL");
+	check_baseline("end");
+}
+
+static void t_realloc_shrink(void) {
+	void *A = must_malloc(1000), *G = must_malloc(16);
+	fill(A, 1000, 1);
+	size_t blocks = stats()->blocks, a0 = area_of(A)->length;
+
+	void *r = an_realloc(A, 100);                      /* next is the free tail: split creates a new free block */
+	CHECK(r == A, "shrink must be in place");
+	check_invariants("shrink 1");
+	CHECK(area_of(A)->length == align_up(100), "length after shrink = %zu", area_of(A)->length);
+	CHECK(verify(A, 100, 1), "data lost on shrink");
+
+	/* A is followed by G (used): remainder must become a real free block */
+	CHECK(area_of(A)->next != area_of(G), "a free remainder block should sit between A and G");
+	area *rem = area_of(A)->next;
+	CHECK(!rem->in_use && rem->length == a0 - align_up(100) - HDR(), "remainder length %zu", rem->length);
+	CHECK(stats()->blocks == blocks + 1, "shrink with split should add one block");
+
+	r = an_realloc(A, 48);                             /* next is now a FREE block: leftover must merge into it */
+	CHECK(r == A, "second shrink must be in place");
+	check_invariants("shrink 2");
+	CHECK(stats()->blocks == blocks + 1, "merging leftover into a free neighbour must not change block count");
+	CHECK(area_of(A)->length == 48 && !area_of(A)->next->in_use &&
+	      area_of(A)->next->length == a0 - 48 - HDR(), "merged remainder wrong");
+	CHECK(verify(A, 48, 1), "data lost on second shrink");
+
+	void *C = must_malloc(64), *g2 = must_malloc(16);   /* leftover smaller than a header: no split */
+	size_t b2 = stats()->blocks;
+	r = an_realloc(C, 48);
+	CHECK(r == C, "tiny shrink must be in place");
+	check_invariants("tiny shrink");
+	CHECK(area_of(C)->length == 64 && stats()->blocks == b2, "leftover < header+MIN_PAYLOAD must not split");
+
+	must_free(A); must_free(C); must_free(G); must_free(g2);
+	check_baseline("end");
+}
+
+static void t_realloc_shrink_releases_pages(void) {
+	void *keep = must_malloc(100);
+	char *big = must_malloc(20000);
+	fill(big, 20000, 2);
+	size_t pages = stats()->pages;
+	void *r = an_realloc(big, 100);
+	CHECK(r == big, "shrink must be in place");
+	check_invariants("after shrinking big block");
+	CHECK(stats()->pages < pages, "heap should shrink (pages %zu -> %zu)", pages, stats()->pages);
+	CHECK(tail_area()->length < PG(), "tail should hold < 1 page, has %zu", tail_area()->length);
+	CHECK(verify(big, 100, 2), "data lost");
+	must_free(big); must_free(keep);
+	check_baseline("end");
+}
+
+static void t_realloc_grow_in_place(void) {
+	void *A = must_malloc(112), *B = must_malloc(112), *G = must_malloc(16);
+	fill(A, 112, 1);
+	must_free(B);                                      /* free hole right after A */
+	size_t blocks = stats()->blocks;
+
+	void *r = an_realloc(A, 160);                      /* total 272 >= 160, remainder 112 -> split */
+	CHECK(r == A, "grow into free neighbour must be in place");
+	check_invariants("grow 1");
+	CHECK(area_of(A)->length == 160, "length %zu, expected 160", area_of(A)->length);
+	CHECK(stats()->blocks == blocks, "absorb (-1) + split (+1): blocks %zu -> %zu", blocks, stats()->blocks);
+	CHECK(!area_of(A)->next->in_use && area_of(A)->next->length == 272 - 160 - HDR(), "remainder wrong");
+	CHECK(verify(A, 112, 1), "data lost on grow");
+
+	r = an_realloc(A, 272);                            /* exactly absorbs the 64-byte hole, no remainder */
+	CHECK(r == A, "exact absorb must be in place");
+	check_invariants("grow 2");
+	CHECK(area_of(A)->length == 272, "length %zu, expected 272", area_of(A)->length);
+	CHECK(area_of(A)->next == area_of(G), "A should now be directly followed by G");
+	CHECK(stats()->blocks == blocks - 1, "exact absorb should remove one block");
+	CHECK(verify(A, 112, 1), "data lost on exact absorb");
+
+	must_free(A); must_free(G);
+	check_baseline("end");
+}
+
+static void t_realloc_grow_into_tail(void) {
+	char *A = must_malloc(100);
+	fill(A, 100, 1);
+	size_t tail0 = tail_area()->length, blocks = stats()->blocks;
+	void *r = an_realloc(A, 1000);
+	CHECK(r == A, "growing into the tail should be in place");
+	check_invariants("grow into tail");
+	CHECK(area_of(A)->length == 1008 && stats()->blocks == blocks, "length/blocks wrong");
+	CHECK(tail_area()->length == tail0 - (1008 - 112), "tail length %zu wrong", tail_area()->length);
+	CHECK(verify(A, 100, 1), "data lost");
+
+	/* leave the tail with 32 bytes: too small to hold a header -> must move instead */
+	size_t want = area_of(A)->length + HDR() + tail_area()->length - 32;
+	void *r2 = an_realloc(A, (ssize_t)want);
+	CHECK(r2 != NULL, "realloc must succeed by moving");
+	check_invariants("grow that cannot stay in place");
+	CHECK(verify(r2, 100, 1), "data lost on move");
+	must_free(r2);
+	check_baseline("end");
+}
+
+static void t_realloc_move(void) {
+	void *A = must_malloc(100), *B = must_malloc(100), *G = must_malloc(16);
+	fill(A, 100, 1); fill(B, 100, 2);
+	void *r = an_realloc(A, 500);                      /* neighbour B is in use: must move */
+	CHECK(r != NULL && r != A, "block must move");
+	check_invariants("move");
+	CHECK(verify(r, 100, 1), "data not copied");
+	CHECK(!area_of(A)->in_use, "old block must be freed after a move");
+	CHECK(verify(B, 100, 2), "neighbour damaged");
+	fill(r, 500, 3);
+	CHECK(verify(r, 500, 3) && verify(B, 100, 2), "new block overlaps neighbour");
+	must_free(r); must_free(B); must_free(G);
+	check_baseline("end");
+}
+
+static void t_realloc_oom(void) {
+	void *A = must_malloc(100), *B = must_malloc(100);
+	fill(A, 100, 1);
+	struct rlimit rl;
+	if (getrlimit(RLIMIT_DATA, &rl) != 0) SKIP("getrlimit failed");
+	rl.rlim_cur = 1;
+	if (setrlimit(RLIMIT_DATA, &rl) != 0) SKIP("setrlimit failed");
+	void *probe = sbrk((intptr_t)PG());
+	if (probe != (void *)-1) { sbrk(-(intptr_t)PG()); SKIP("kernel does not enforce RLIMIT_DATA on brk"); }
+
+	errno = 0;
+	CHECK(an_realloc(A, 1 << 20) == NULL, "realloc beyond limit must return NULL");
+	check_invariants("after failed realloc");
+	CHECK(area_of(A)->in_use && verify(A, 100, 1), "original block must stay valid after failed realloc");
+	must_free(A); must_free(B);
+}
+
+static void stress_realloc(unsigned seed, int ops) {
+	srand(seed);
+	for (int op = 0; op < ops; op++) {
+		int i = rand() % SLOTS;
+		if (!s_ptr[i]) {
+			s_len[i] = pick_size(); s_seed[i] = (unsigned)rand();
+			s_ptr[i] = must_malloc(s_len[i]);
+			fill(s_ptr[i], s_len[i], s_seed[i]);
+		} else if (rand() % 3 == 0) {
+			CHECK(verify(s_ptr[i], s_len[i], s_seed[i]), "seed %u op %d: slot %d corrupted", seed, op, i);
+			must_free(s_ptr[i]);
+			s_ptr[i] = NULL;
+		} else {
+			size_t n = pick_size();
+			void *q = an_realloc(s_ptr[i], (ssize_t)n);
+			CHECK(q != NULL, "seed %u op %d: realloc(%zu -> %zu) failed", seed, op, s_len[i], n);
+			check_invariants("after an_realloc");
+			size_t keep = n < s_len[i] ? n : s_len[i];
+			CHECK(verify(q, keep, s_seed[i]), "seed %u op %d: realloc lost data (%zu -> %zu)", seed, op, s_len[i], n);
+			s_ptr[i] = q; s_len[i] = n; s_seed[i] = (unsigned)rand();
+			fill(q, n, s_seed[i]);
+		}
+	}
+	for (int i = 0; i < SLOTS; i++) {
+		if (!s_ptr[i]) continue;
+		CHECK(verify(s_ptr[i], s_len[i], s_seed[i]), "seed %u: slot %d corrupted at end", seed, i);
+		must_free(s_ptr[i]);
+		s_ptr[i] = NULL;
+	}
+	check_baseline("after realloc stress");
+}
+static void t_realloc_stress1(void) { stress_realloc(7, 4000); }
+static void t_realloc_stress2(void) { stress_realloc(99, 4000); }
+#endif /* TEST_REALLOC */
+
+
+#ifdef TEST_CALLOC
+static void t_calloc_zeroes_reused_memory(void) {
+	size_t sizes[][2] = { {128,1}, {10,7}, {1,1}, {3,1000}, {1,5000}, {16,16} };
+	for (size_t k = 0; k < sizeof sizes / sizeof sizes[0]; k++) {
+		size_t n = sizes[k][0], s = sizes[k][1], total = n * s;
+		unsigned char *g = must_malloc(32);            /* guard so the block is reused in place */
+		unsigned char *p = must_malloc(total);
+		memset(p, 0xAB, area_of(p)->length);           /* dirty the whole payload */
+		memset(g, 0xCD, 32);
+		must_free(p);
+		unsigned char *q = an_calloc(n, s);
+		CHECK(q != NULL, "calloc(%zu,%zu) returned NULL", n, s);
+		check_invariants("after calloc");
+		for (size_t i = 0; i < total; i++)
+			CHECK(q[i] == 0, "calloc(%zu,%zu): byte %zu is 0x%02x, not zero", n, s, i, q[i]);
+		for (size_t i = 0; i < 32; i++)
+			CHECK(g[i] == 0xCD, "calloc(%zu,%zu) wrote into the neighbouring block", n, s);
+		must_free(q); must_free(g);
+		check_baseline("end of iteration");
+	}
+}
+
+static void t_calloc_invalid(void) {
+	void *keep = must_malloc(16);
+	size_t pages = stats()->pages, blocks = stats()->blocks;
+	errno = 0; CHECK(an_calloc(SIZE_MAX, 2) == NULL && errno == ENOMEM, "SIZE_MAX*2 must fail with ENOMEM");
+	errno = 0; CHECK(an_calloc((size_t)1 << 32, (size_t)1 << 32) == NULL && errno == ENOMEM, "2^32*2^32 must fail");
+	errno = 0; CHECK(an_calloc(2, (size_t)SSIZE_MAX) == NULL && errno == ENOMEM, "2*SSIZE_MAX must fail");
+	errno = 0; CHECK(an_calloc((size_t)SSIZE_MAX + 1, 1) == NULL && errno == ENOMEM, "> SSIZE_MAX must fail");
+	CHECK(an_calloc(0, 10) == NULL, "calloc(0, n) must return NULL like malloc(0)");
+	CHECK(an_calloc(10, 0) == NULL, "calloc(n, 0) must return NULL like malloc(0)");
+	check_invariants("after invalid callocs");
+	CHECK(stats()->pages == pages && stats()->blocks == blocks, "failed calloc changed stats");
+	must_free(keep);
+	check_baseline("end");
+}
+
+static void t_calloc_multi_page(void) {
+	unsigned char *p = an_calloc(100, 1000);          /* 100000 bytes, grows the heap */
+	CHECK(p != NULL, "calloc(100,1000) returned NULL");
+	check_invariants("after big calloc");
+	for (size_t i = 0; i < 100000; i++) CHECK(p[i] == 0, "byte %zu not zero", i);
+	must_free(p);
+	check_baseline("end");
+}
+#endif /* TEST_CALLOC */
+
 /* ------------------------------------------------------------------ */
 /* Harness                                                             */
 /* ------------------------------------------------------------------ */
@@ -750,6 +1003,22 @@ static const test_case TESTS[] = {
 	{"stress_seed2",                      t_stress_seed2},
 	{"stress_seed3",                      t_stress_seed3},
 	{"out_of_memory",                     t_out_of_memory},
+#ifdef TEST_REALLOC
+	{"realloc_edge_cases",                t_realloc_edge_cases},
+	{"realloc_shrink",                    t_realloc_shrink},
+	{"realloc_shrink_releases_pages",     t_realloc_shrink_releases_pages},
+	{"realloc_grow_in_place",             t_realloc_grow_in_place},
+	{"realloc_grow_into_tail",            t_realloc_grow_into_tail},
+	{"realloc_move",                      t_realloc_move},
+	{"realloc_oom",                       t_realloc_oom},
+	{"realloc_stress1",                   t_realloc_stress1},
+	{"realloc_stress2",                   t_realloc_stress2},
+#endif
+#ifdef TEST_CALLOC
+	{"calloc_zeroes_reused_memory",       t_calloc_zeroes_reused_memory},
+	{"calloc_invalid",                    t_calloc_invalid},
+	{"calloc_multi_page",                 t_calloc_multi_page},
+#endif
 };
 #define NTESTS (sizeof TESTS / sizeof TESTS[0])
 
@@ -760,7 +1029,7 @@ static int run_one(const test_case *t) {
 	pid_t pid = fork();
 	if (pid < 0) { perror("fork"); return 1; }
 	if (pid == 0) {
-		alarm(20);                  /* a stuck lock (sleep loop) shows up as a timeout */
+		alarm(TEST_ALARM);                  /* a stuck lock (sleep loop) shows up as a timeout */
 		t->fn();
 		_exit(0);
 	}

@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <limits.h>
 
 #define ALIGNMENT _Alignof(max_align_t)
 
@@ -22,8 +23,8 @@ size_t align_up(size_t size) {
 }
 
 size_t align_page_up(size_t size) {
-	if (size > SIZE_MAX - (PAGE_SIZE - 1)) return 0;
-	return (size + (PAGE_SIZE - 1)) & ~(size_t)(PAGE_SIZE - 1);
+	if (size > SIZE_MAX - ((size_t)PAGE_SIZE - 1)) return 0;
+	return (size + ((size_t)PAGE_SIZE - 1)) & ~(size_t)(PAGE_SIZE - 1);
 }
 
 typedef struct free_area {
@@ -41,9 +42,7 @@ typedef struct allocation_stats {
 	size_t pages;
 } my_stats;
 
-const int FIRST_BLOCK_OFFSET = sizeof(area);
 char *heap_start = NULL;
-
 bool allocator_initialized = false;
 
 static my_stats *get_malloc_header(void) {
@@ -365,215 +364,345 @@ bool an_free(void *ptr) {
 	return true;
 }
 
-void display_ll(area *head) {
-    printf("Linked List: ");
-
-    while (head) {
-        printf("%zu (%s) -> ", head->length, head->in_use ? "USED" : "FREE");
-        head = head->next;
-    }
-
-    printf("NULL\n");
-}
-
-void test_linked_list(area *head) {
-    area *previous = NULL;
-
-    while (head != NULL) {
-        assert(head->marker == BLOCK_MARKER);
-        assert(head->prev == previous);
-
-        if (head->next != NULL) {
-            assert(head->next->prev == head);
-        }
-
-        previous = head;
-        head = head->next;
-    }
-
-    assert(previous != NULL);
-    assert(previous->in_use == false);
-
-    printf("Linked list integrity: PASSED\n");
-}
-
-void test_basic_malloc() {
-    char *ptr = (char *)an_malloc(8192);
-	char *ptr1 = (char *)an_malloc(16384);
-	char *ptr2 = (char *)an_malloc(32768);
-
-    assert(ptr != NULL);
-	assert(ptr1 != NULL);
-	assert(ptr2 != NULL);
-	assert(ptr != ptr1);
-	assert(ptr != ptr2);
-	assert(ptr1 != ptr2);
-
-    area *first_block = (area *)((char *)ptr - align_up(sizeof(area)));
-
-    assert(first_block->marker == BLOCK_MARKER);
-    assert(first_block->in_use == true);
-
-	memset(ptr, 'A', 8192);
-	memset(ptr1, 'B', 16384);
-	memset(ptr2, 'C', 32768);
-
-    for (size_t i = 0; i < 8192; i++)
-    assert(ptr[i] == 'A');
-
-	for (size_t i = 0; i < 16384; i++)
-		assert(ptr1[i] == 'B');
-
-	for (size_t i = 0; i < 32768; i++)
-		assert(ptr2[i] == 'C');
-
+void *an_realloc(void *ptr, ssize_t size) {
+	if (!ptr) return an_malloc(size);
+	if (size == 0) {
+		an_free(ptr);
+		return NULL;
+	}
+	if (size < 0) {
+		errno = EINVAL;
+		return NULL;
+	}
 	my_stats *malloc_header = get_malloc_header();
+	while(malloc_header->lock) sleep(1);
+	malloc_header->lock = true;
+	area* block = find_block_from_payload(ptr);
+	if (!block || !block->in_use || block->marker != BLOCK_MARKER) {
+		malloc_header->lock = false;
+		errno = EINVAL;
+		return NULL;
+	}
+	size_t aligned_size = align_up((size_t)size);
+	if (aligned_size == 0) {
+		malloc_header->lock = false;
+		errno = ENOMEM;
+		return NULL;
+	}
+	if (aligned_size == block->length) {
+		malloc_header->lock = false;
+		return ptr;
+	}
 
-	printf("Basic Malloc result %p\n", (void *)ptr);
-	printf("Block size: %zu\n", first_block->length);
-	printf("Number of Blocks: %zu\n", malloc_header->blocks);
-	printf("Number of Pages: %zu\n", malloc_header->pages);
+	//shrink
+	if (aligned_size < block->length) {
+		size_t leftover_size = block->length - aligned_size;
+		if (leftover_size >= align_up(sizeof(area)) + MIN_PAYLOAD) {
+			area *new_block = (area *)((char *)block + align_up(sizeof(area)) + aligned_size);
+			new_block->in_use = false;
+			new_block->length = leftover_size - align_up(sizeof(area));
+			new_block->marker = BLOCK_MARKER;
+			new_block->next = block->next;
+			new_block->prev = block;
+			if (new_block->next) new_block->next->prev = new_block;
+			block->next = new_block;
+			block->length = aligned_size;
+			malloc_header->blocks += 1;
 
-	display_ll(first_block);
-	test_linked_list(first_block);
-}
-
-void test_free() {
-
-	int arr[100] = {
-		3444, 346, 2017, 2506, 2526, 3538, 1802, 3453, 1508, 1406,
-		647, 3270, 3564, 286, 3415, 3322, 1105, 108, 808, 1253,
-		1386, 3222, 408, 3920, 2407, 2486, 1626, 738, 2690, 1651,
-		206, 3017, 3368, 3620, 3397, 455, 3380, 349, 1001, 2713,
-		2548, 3470, 1582, 458, 2882, 822, 1408, 712, 240, 2137,
-		3880, 3611, 4011, 1159, 4079, 3026, 1640, 1136, 3485, 3778,
-		7, 1105, 3461, 3790, 1169, 2846, 57, 319, 2572, 712,
-		2193, 3062, 2420, 897, 3088, 3336, 2376, 1017, 2764, 1953,
-		1960, 175, 2168, 1950, 1474, 417, 2901, 2416, 2075, 2809,
-		3837, 2748, 3077, 3682, 631, 1455, 606, 3017, 583, 450
-	};
-
-	char *ptr[150] = {NULL};
-
-	for (int i = 0; i < 100; i++) {
-		ptr[i] = (char *)an_malloc((size_t)arr[i]);
-
-		if (ptr[i] == NULL) {
-			printf("Allocation failed at index %d, size %d\n", i, arr[i]);
-			break;
+			if (new_block->next && !new_block->next->in_use) {
+				area *n = new_block->next;
+				new_block->length += align_up(sizeof(area)) + n->length;
+				new_block->next = n->next;
+				if (n->next) n->next->prev = new_block;
+				malloc_header->blocks -= 1;
+			}
+		}
+		reduce_heap_size_if_possible();
+		malloc_header->lock = false;
+		return ptr;
+	}
+	//grow
+	area *next_block = block->next;
+	if (next_block && !next_block->in_use) {
+		size_t total = block->length + align_up(sizeof(area)) + next_block->length;
+		size_t need = 0;
+		if (next_block->next) need = aligned_size;
+		else need = aligned_size + align_up(sizeof(area)) + MIN_PAYLOAD;
+		if (total >= need) {
+			block->next = next_block->next;
+			if (next_block->next) next_block->next->prev = block;
+			block->length = total;
+			malloc_header->blocks -= 1;
+			size_t leftover_size = block->length - aligned_size;
+			if (leftover_size >= align_up(sizeof(area)) + MIN_PAYLOAD) {
+				area *new_block = (area *)((char *)block + align_up(sizeof(area)) + aligned_size);
+				new_block->in_use = false;
+				new_block->length = leftover_size - align_up(sizeof(area));
+				new_block->marker = BLOCK_MARKER;
+				new_block->next = block->next;
+				new_block->prev = block;
+				if (new_block->next) new_block->next->prev = new_block;
+				block->next = new_block;
+				block->length = aligned_size;
+				malloc_header->blocks += 1;
+			}
+			malloc_header->lock = false;
+			return ptr;
 		}
 	}
-
-	area *first_block = (area *)((char *)ptr[0] - align_up(sizeof(area)));
-	assert(first_block->next != NULL);
-
-	area *temp = first_block;
-	while (temp) {
-		assert(temp->marker == BLOCK_MARKER);
-
-		if (temp->next != NULL) {
-			assert(temp->in_use == true);
-		} else {
-			assert(temp->in_use == false);
-		}
-
-		temp = temp->next;
-	}
-
-	printf("After allocation: ");
-	display_ll(first_block);
-
-	my_stats *malloc_header = get_malloc_header();
-	printf("Number of blocks: %zu\n", malloc_header->blocks);
-	printf("Number of pages: %zu\n", malloc_header->pages);
-
-	printf("\nFreeing every alternate block.\n");
-	for (int i = 0; i < 100; i += 2) {
-		an_free(ptr[i]);
-	}
-	printf("After freeing: ");
-	display_ll(first_block);
-	printf("Number of blocks: %zu\n", malloc_header->blocks);
-	printf("Number of pages: %zu\n", malloc_header->pages);
-
-	int arr2[50] = {
-		1468, 2116, 1549, 2351, 3241, 686, 1335, 3969, 3509, 2215,
-		3895, 2812, 4083, 980, 1111, 28, 14, 2211, 3614, 2456,
-		619, 2124, 3789, 296, 3705, 3563, 689, 149, 185, 3741,
-		2070, 3281, 2086, 4057, 2497, 2276, 1128, 2535, 1438, 2189,
-		2045, 3115, 3755, 2325, 1006, 3886, 502, 593, 1469, 3910
-	};
-
-	for (int i = 0; i < 50; i++) {
-		ptr[100 + i] = (char *)an_malloc((size_t)arr2[i]);
-	}
-
-	printf("After 50 more blocks: ");
-	display_ll(first_block);
-	printf("Number of blocks: %zu\n", malloc_header->blocks);
-	printf("Number of pages: %zu\n", malloc_header->pages);
-
-	printf("Free every block.\n");
-	for (int i = 0; i < 150; i++) {
-		an_free(ptr[i]);
-	}
-	display_ll(first_block);
-	printf("Number of blocks: %zu\n", malloc_header->blocks);
-	printf("Number of pages: %zu\n", malloc_header->pages);
+	malloc_header->lock = false;
+	void *fresh = an_malloc(size);
+	if (!fresh) return NULL;
+	memcpy(fresh, ptr, block->length);
+	an_free(ptr);
+	return fresh;
 }
 
-void test_reduce_heap_size(void) {
-	char *ptr = (char *)an_malloc(128);
-	char *ptr1 = (char *)an_malloc(64);
-	char *ptr2 = (char *)an_malloc(256);
-	char *ptr3 = (char *)an_malloc(1024);
-
-	char *ptr4 = (char *)an_malloc(12228);
-
-	area *first_block = (area *)((char *)ptr - align_up(sizeof(area)));
-
-	printf("After allocation: ");
-	display_ll(first_block);
-	my_stats *malloc_header = get_malloc_header();
-	printf("Number of blocks: %zu\n", malloc_header->blocks);
-	printf("Number of pages: %zu\n", malloc_header->pages);
-
-	void *heap_before_free = sbrk_return_current_break();
-	an_free(ptr4);
-	void *heap_after_free = sbrk_return_current_break();
-	assert((char *)heap_before_free - (char *)heap_after_free == 3 * PAGE_SIZE);
-
-	printf("After freeing: ");
-	display_ll(first_block);
-	printf("Number of blocks: %zu\n", malloc_header->blocks);
-	printf("Number of pages: %zu\n", malloc_header->pages);
-
-	ptr4 = (char *)an_malloc(4096);
-
-	printf("After allocating again: ");
-	display_ll(first_block);
-	printf("Number of blocks: %zu\n", malloc_header->blocks);
-	printf("Number of pages: %zu\n", malloc_header->pages);
-}
-
-void call_test(void (*test_func)(), const char *msg) {
-	pid_t pid = fork();
-	if (!pid) {
-		test_func();
-		exit(0);
+void *an_calloc(size_t nmofele, size_t size) {
+	if (nmofele != 0 && size > SIZE_MAX / nmofele) {
+		errno = ENOMEM;
+		return NULL;
 	}
-	int status;
-	waitpid(pid, &status, 0);
-	if (WIFSIGNALED(status))
-		printf("%s crashed with signal %d\n", msg, WTERMSIG(status));
-	else
-		printf("%s passed.\n", msg);
+	size_t total = size * nmofele;
+	if (total > SSIZE_MAX) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	void *ptr = an_malloc((ssize_t)total);
+	if (ptr) memset(ptr, 0, total);
+	return ptr;
 }
 
-int main() {
-	printf("Running my Memory Allocator.\n");
-	call_test(test_basic_malloc, "Basic Malloc");
-	call_test(test_free, "Basic Free");
-	call_test(test_reduce_heap_size, "Basic Heap Reduction");
-	return 0;
-}
+// void display_ll(area *head) {
+//     printf("Linked List: ");
+
+//     while (head) {
+//         printf("%zu (%s) -> ", head->length, head->in_use ? "USED" : "FREE");
+//         head = head->next;
+//     }
+
+//     printf("NULL\n");
+// }
+
+// void test_linked_list(area *head) {
+//     area *previous = NULL;
+
+//     while (head != NULL) {
+//         assert(head->marker == BLOCK_MARKER);
+//         assert(head->prev == previous);
+
+//         if (head->next != NULL) {
+//             assert(head->next->prev == head);
+//         }
+
+//         previous = head;
+//         head = head->next;
+//     }
+
+//     assert(previous != NULL);
+//     assert(previous->in_use == false);
+
+//     printf("Linked list integrity: PASSED\n");
+// }
+
+// void test_basic_malloc() {
+//     char *ptr = (char *)an_malloc(8192);
+// 	char *ptr1 = (char *)an_malloc(16384);
+// 	char *ptr2 = (char *)an_malloc(32768);
+
+//     assert(ptr != NULL);
+// 	assert(ptr1 != NULL);
+// 	assert(ptr2 != NULL);
+// 	assert(ptr != ptr1);
+// 	assert(ptr != ptr2);
+// 	assert(ptr1 != ptr2);
+
+//     area *first_block = (area *)((char *)ptr - align_up(sizeof(area)));
+
+//     assert(first_block->marker == BLOCK_MARKER);
+//     assert(first_block->in_use == true);
+
+// 	memset(ptr, 'A', 8192);
+// 	memset(ptr1, 'B', 16384);
+// 	memset(ptr2, 'C', 32768);
+
+//     for (size_t i = 0; i < 8192; i++)
+//    		assert(ptr[i] == 'A');
+
+// 	for (size_t i = 0; i < 16384; i++)
+// 		assert(ptr1[i] == 'B');
+
+// 	for (size_t i = 0; i < 32768; i++)
+// 		assert(ptr2[i] == 'C');
+
+// 	my_stats *malloc_header = get_malloc_header();
+
+// 	printf("Basic Malloc result %p\n", (void *)ptr);
+// 	printf("Block size: %zu\n", first_block->length);
+// 	printf("Number of Blocks: %zu\n", malloc_header->blocks);
+// 	printf("Number of Pages: %zu\n", malloc_header->pages);
+
+// 	display_ll(first_block);
+// 	test_linked_list(first_block);
+// }
+
+// void test_free() {
+
+// 	int arr[100] = {
+// 		3444, 346, 2017, 2506, 2526, 3538, 1802, 3453, 1508, 1406,
+// 		647, 3270, 3564, 286, 3415, 3322, 1105, 108, 808, 1253,
+// 		1386, 3222, 408, 3920, 2407, 2486, 1626, 738, 2690, 1651,
+// 		206, 3017, 3368, 3620, 3397, 455, 3380, 349, 1001, 2713,
+// 		2548, 3470, 1582, 458, 2882, 822, 1408, 712, 240, 2137,
+// 		3880, 3611, 4011, 1159, 4079, 3026, 1640, 1136, 3485, 3778,
+// 		7, 1105, 3461, 3790, 1169, 2846, 57, 319, 2572, 712,
+// 		2193, 3062, 2420, 897, 3088, 3336, 2376, 1017, 2764, 1953,
+// 		1960, 175, 2168, 1950, 1474, 417, 2901, 2416, 2075, 2809,
+// 		3837, 2748, 3077, 3682, 631, 1455, 606, 3017, 583, 450
+// 	};
+
+// 	char *ptr[150] = {NULL};
+
+// 	for (int i = 0; i < 100; i++) {
+// 		ptr[i] = (char *)an_malloc((size_t)arr[i]);
+
+// 		if (ptr[i] == NULL) {
+// 			printf("Allocation failed at index %d, size %d\n", i, arr[i]);
+// 			break;
+// 		}
+// 	}
+
+// 	area *first_block = (area *)((char *)ptr[0] - align_up(sizeof(area)));
+// 	assert(first_block->next != NULL);
+
+// 	area *temp = first_block;
+// 	while (temp) {
+// 		assert(temp->marker == BLOCK_MARKER);
+
+// 		if (temp->next != NULL) {
+// 			assert(temp->in_use == true);
+// 		} else {
+// 			assert(temp->in_use == false);
+// 		}
+
+// 		temp = temp->next;
+// 	}
+
+// 	printf("After allocation: ");
+// 	display_ll(first_block);
+
+// 	my_stats *malloc_header = get_malloc_header();
+// 	printf("Number of blocks: %zu\n", malloc_header->blocks);
+// 	printf("Number of pages: %zu\n", malloc_header->pages);
+
+// 	printf("\nFreeing every alternate block.\n");
+// 	for (int i = 0; i < 100; i += 2) {
+// 		an_free(ptr[i]);
+// 	}
+// 	printf("After freeing: ");
+// 	display_ll(first_block);
+// 	printf("Number of blocks: %zu\n", malloc_header->blocks);
+// 	printf("Number of pages: %zu\n", malloc_header->pages);
+
+// 	int arr2[50] = {
+// 		1468, 2116, 1549, 2351, 3241, 686, 1335, 3969, 3509, 2215,
+// 		3895, 2812, 4083, 980, 1111, 28, 14, 2211, 3614, 2456,
+// 		619, 2124, 3789, 296, 3705, 3563, 689, 149, 185, 3741,
+// 		2070, 3281, 2086, 4057, 2497, 2276, 1128, 2535, 1438, 2189,
+// 		2045, 3115, 3755, 2325, 1006, 3886, 502, 593, 1469, 3910
+// 	};
+
+// 	for (int i = 0; i < 50; i++) {
+// 		ptr[100 + i] = (char *)an_malloc((size_t)arr2[i]);
+// 	}
+
+// 	printf("After 50 more blocks: ");
+// 	display_ll(first_block);
+// 	printf("Number of blocks: %zu\n", malloc_header->blocks);
+// 	printf("Number of pages: %zu\n", malloc_header->pages);
+
+// 	printf("Free every block.\n");
+// 	for (int i = 0; i < 150; i++) {
+// 		an_free(ptr[i]);
+// 	}
+// 	display_ll(first_block);
+// 	printf("Number of blocks: %zu\n", malloc_header->blocks);
+// 	printf("Number of pages: %zu\n", malloc_header->pages);
+// }
+
+// void test_reduce_heap_size(void) {
+// 	char *ptr = (char *)an_malloc(128);
+// 	char *ptr1 = (char *)an_malloc(64);
+// 	char *ptr2 = (char *)an_malloc(256);
+// 	char *ptr3 = (char *)an_malloc(1024);
+
+// 	char *ptr4 = (char *)an_malloc(12228);
+
+// 	area *first_block = (area *)((char *)ptr - align_up(sizeof(area)));
+
+// 	printf("After allocation: ");
+// 	display_ll(first_block);
+// 	my_stats *malloc_header = get_malloc_header();
+// 	printf("Number of blocks: %zu\n", malloc_header->blocks);
+// 	printf("Number of pages: %zu\n", malloc_header->pages);
+
+// 	void *heap_before_free = sbrk_return_current_break();
+// 	an_free(ptr4);
+// 	void *heap_after_free = sbrk_return_current_break();
+// 	assert((char *)heap_before_free - (char *)heap_after_free == 3 * PAGE_SIZE);
+
+// 	printf("After freeing: ");
+// 	display_ll(first_block);
+// 	printf("Number of blocks: %zu\n", malloc_header->blocks);
+// 	printf("Number of pages: %zu\n", malloc_header->pages);
+
+// 	ptr4 = (char *)an_malloc(4096);
+
+// 	printf("After allocating again: ");
+// 	display_ll(first_block);
+// 	printf("Number of blocks: %zu\n", malloc_header->blocks);
+// 	printf("Number of pages: %zu\n", malloc_header->pages);
+// }
+
+// void test_calloc(void) {
+// 	char *ptr = (char *)an_malloc(70);
+// 	area *first_block = (area *)((char *)ptr - align_up(sizeof(area)));
+
+//     assert(first_block->marker == BLOCK_MARKER);
+//     assert(first_block->in_use == true);
+
+// 	memset(ptr, 'A', 70);
+// 	for (size_t i = 0; i < 70; i++) {
+// 		assert(ptr[i] == 'A');
+// 	}
+// 	display_ll(first_block);
+// 	an_free(ptr);
+// 	display_ll(first_block);
+// 	ptr = (char *)an_calloc(7, 10);
+// 	for (size_t i = 0; i < 70; i++) {
+// 		assert(ptr[i] == 0);
+// 	}
+// }
+
+// void call_test(void (*test_func)(), const char *msg) {
+// 	pid_t pid = fork();
+// 	if (!pid) {
+// 		test_func();
+// 		exit(0);
+// 	}
+// 	int status;
+// 	waitpid(pid, &status, 0);
+// 	if (WIFSIGNALED(status))
+// 		printf("%s crashed with signal %d\n", msg, WTERMSIG(status));
+// 	else
+// 		printf("%s passed.\n", msg);
+// }
+
+// int main() {
+// 	printf("Running my Memory Allocator.\n");
+// 	//call_test(test_basic_malloc, "Basic Malloc");
+// 	//call_test(test_free, "Basic Free");
+// 	//call_test(test_reduce_heap_size, "Basic Heap Reduction");
+// 	call_test(test_calloc, "Basic calloc");
+// 	return 0;
+// }
