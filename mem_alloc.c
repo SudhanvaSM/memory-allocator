@@ -11,21 +11,10 @@
 #include <limits.h>
 
 #define ALIGNMENT _Alignof(max_align_t)
-
-const int INIT_MARKER = 0x55;
-const int BLOCK_MARKER = 0xDD;
-const int PAGE_SIZE = 4096;
-const size_t MIN_PAYLOAD = 16;
-
-size_t align_up(size_t size) {
-	if (size > SIZE_MAX - (ALIGNMENT - 1)) return 0;
-    return (size + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1);
-}
-
-size_t align_page_up(size_t size) {
-	if (size > SIZE_MAX - ((size_t)PAGE_SIZE - 1)) return 0;
-	return (size + ((size_t)PAGE_SIZE - 1)) & ~(size_t)(PAGE_SIZE - 1);
-}
+#define PAGE_SIZE 4096
+#define INIT_MARKER 0x55
+#define BLOCK_MARKER 0xDD
+#define MIN_PAYLOAD ((size_t)16)
 
 typedef struct free_area {
 	uint8_t marker;
@@ -42,49 +31,52 @@ typedef struct allocation_stats {
 	size_t pages;
 } my_stats;
 
-char *heap_start = NULL;
-bool allocator_initialized = false;
+static char *heap_start = NULL;
+static bool allocator_initialized = false;
+
+static size_t align_up(size_t size) {
+	if (size > SIZE_MAX - (ALIGNMENT - 1)) return 0;
+	return (size + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1);
+}
+
+static size_t align_page_up(size_t size) {
+	if (size > SIZE_MAX - (PAGE_SIZE - 1)) return 0;
+	return (size + (PAGE_SIZE - 1)) & ~(size_t)(PAGE_SIZE - 1);
+}
+
+static inline size_t header_size(void) {
+	return align_up(sizeof(area));
+} 
+
+static inline size_t stats_size(void) {
+	return align_up(sizeof(my_stats));
+}
+
+static void fatal(const char *msg, size_t len) {
+	ssize_t r = write(STDERR_FILENO, msg, len);
+	(void)r;
+	abort();
+}
+
+static inline void *payload_of(area *block) {
+	return ((char *)block + header_size());
+}
+
+#define FATAL(literal) fatal(literal, sizeof(literal) - 1)
 
 static my_stats *get_malloc_header(void) {
-	if (!allocator_initialized) {
-		const char msg[] = "Fatal: allocator not initialized.\n";
-        write(STDERR_FILENO, msg, sizeof(msg) - 1);
-        abort();
-	}
-    if (!heap_start) {
-        const char msg[] = "Fatal: uninitialized heap start.\n";
-        write(STDERR_FILENO, msg, sizeof(msg) - 1);
-        abort();
-    }
-
+	if (!allocator_initialized) 
+		FATAL("FATAL: allocator not initialized.\n");
+	if (!heap_start) 
+		FATAL("Fatal: uninitialized heap start.\n");
     my_stats *malloc_header = (my_stats *)heap_start;
-    if (malloc_header->init_marker != INIT_MARKER) {
-        const char msg[] = "Fatal: corrupted allocator header.\n";
-        write(STDERR_FILENO, msg, sizeof(msg) - 1);
-        abort();
-    }
-
+    if (malloc_header->init_marker != INIT_MARKER) 
+		FATAL("Fatal: corrupted allocator header.\n");
     return malloc_header;
 }
 
-area *find_last_block(void) {
-	my_stats *malloc_header = get_malloc_header();
-	area *block = (area *)((char *)malloc_header + align_up(sizeof(my_stats)));
-	while (block->next) block = block->next;
-	return block;
-}
-
-area *find_previous_used_block(area *ptr) {
-	area *mov_ptr = ptr;
-	while (mov_ptr->prev) {
-		mov_ptr = mov_ptr->prev;
-		if (mov_ptr->in_use) return mov_ptr;
-	}
-	return NULL;
-}
-
-void* sbrk_return_current_break(void) {
-	void* heap_location = sbrk(0);
+static void *sbrk_return_current_break(void) {
+	void *heap_location = sbrk(0);
 	if (heap_location == (void *) -1) {
 		perror("sbrk(0) failed.\n");
 		return NULL;
@@ -92,7 +84,7 @@ void* sbrk_return_current_break(void) {
 	return heap_location;
 }
 
-int sbrk_step(ssize_t size) {
+static int sbrk_step(ssize_t size) {
 	if (size == 0) return 0;
 	void *prev_break = sbrk(size);
 	if (prev_break == (void *) -1) {
@@ -102,262 +94,160 @@ int sbrk_step(ssize_t size) {
 	return 0;
 }
 
-void *add_new_trailing_block(size_t remaining_size) {
-	area* last_block = find_last_block();
-	area *new_block = (area *)((char *)last_block + last_block->length + align_up(sizeof(area)));
-	new_block->in_use = false;
-	new_block->length = remaining_size;
-	new_block->marker = BLOCK_MARKER;
-	new_block->next = NULL;
-	new_block->prev = last_block;
-	last_block->next = new_block;
-	return new_block;
+static area *find_last_block(void) {
+	my_stats *malloc_header = get_malloc_header();
+	area *block = (area *)((char *)malloc_header + stats_size());
+	while (block->next) block = block->next;
+	return block;
 }
 
-void *add_used_block_best_fit(size_t size) {
-	my_stats *malloc_header = get_malloc_header();
-	while (malloc_header->lock) sleep(1);
-
-	size_t aligned_size = align_up(size);
-	if (aligned_size == 0) return NULL;
-
-	malloc_header->lock = true;
-	area *block = (area *)(heap_start + align_up(sizeof(my_stats)));
-	area *smallest_block = NULL;
-	area *last_block = block;
-
-	while (block != NULL) {
-		assert(block->marker == BLOCK_MARKER);
+static area *find_best_fit(size_t aligned_size) {
+	area *best = NULL;
+	area *block = (area *)(heap_start + stats_size());
+	while(block) {
+		if (block->marker != BLOCK_MARKER) 
+			FATAL("FATAL: heap corruption (bad block marker).\n");
 		if (block->length >= aligned_size && !block->in_use) {
-			if (!smallest_block || smallest_block->length > block->length) {
-				smallest_block = block;
-			}
+			if (!best || best->length >= block->length) 
+				best = block;
 		}
 		block = block->next;
 	}
-	if (!smallest_block) {
-		last_block = find_last_block();
-
-		const size_t overhead = align_up(sizeof(area)) + MIN_PAYLOAD;
-		if (aligned_size > SIZE_MAX - overhead) {
-			// Overflow would occur: aligned_size is too large to ever split or allocate
-			errno = ENOMEM;
-			malloc_header->lock = false;
-			return NULL;
-		}
-
-		size_t required_size = aligned_size + overhead;
-		assert(!last_block->in_use);
-		while (last_block->length < required_size) {
-			size_t deficit = required_size - last_block->length;
-			if (deficit > SIZE_MAX - (size_t)(PAGE_SIZE - 1)) {
-				malloc_header->lock = false;
-				errno = ENOMEM;
-				return NULL;
-			}
-			size_t bytes_to_add = align_page_up(deficit);
-			if (last_block->length > SIZE_MAX - bytes_to_add) {
-				malloc_header->lock = false;
-				errno = ENOMEM;
-				return NULL;
-			}
-			if (sbrk_step(bytes_to_add) != 0) {
-				malloc_header->lock = false;
-				errno = ENOMEM;
-				return NULL;
-			}
-			last_block->length += bytes_to_add;
-			malloc_header->pages += bytes_to_add / PAGE_SIZE;
-		}
-		size_t last_block_size = last_block->length;
-		last_block->in_use = true;
-		last_block->length = aligned_size;
-		last_block->marker = BLOCK_MARKER;
-		last_block->next = NULL;
-
-		size_t remaining_size = last_block_size - aligned_size - align_up(sizeof(area));
-		add_new_trailing_block(remaining_size);
-		malloc_header->blocks += 1;
-		smallest_block = last_block;
-	}
-	else {
-		size_t min_split_overhead = align_up(sizeof(area)) + MIN_PAYLOAD;
-		if (smallest_block->length >= min_split_overhead 
-			&& smallest_block->length - min_split_overhead >= aligned_size) {
-
-			size_t old_length = smallest_block -> length;
-			area *new_block = (area *)((char *)smallest_block + align_up(sizeof(area)) + aligned_size);
-			new_block->in_use = false;
-			new_block->marker = BLOCK_MARKER;
-			new_block->prev = smallest_block;
-			new_block->next = smallest_block->next;
-			if (new_block->next) (new_block->next)->prev = new_block;
-			smallest_block->next = new_block;
-			new_block->length = old_length - aligned_size - align_up(sizeof(area));
-			smallest_block->length = aligned_size;
-			smallest_block->in_use = true;
-			malloc_header->blocks += 1;
-		}
-		else if (smallest_block->next) {
-			smallest_block->in_use = true;
-		}
-		else {
-			const size_t overhead = align_up(sizeof(area)) + MIN_PAYLOAD;
-			if (aligned_size > SIZE_MAX - overhead) {
-				// Overflow would occur: aligned_size is too large to ever split or allocate
-				errno = ENOMEM;
-				malloc_header->lock = false;
-				return NULL;
-			}
-
-			size_t required_size = aligned_size + overhead;
-			size_t deficit = required_size - smallest_block->length;
-			if (deficit > SIZE_MAX - (size_t)(PAGE_SIZE - 1)) {
-				malloc_header->lock = false;
-				errno = ENOMEM;
-				return NULL;
-			}
-			size_t bytes_to_add = align_page_up(deficit);
-			if (smallest_block->length > SIZE_MAX - bytes_to_add) {
-				malloc_header->lock = false;
-				errno = ENOMEM;
-				return NULL;
-			}
-			if (sbrk_step(bytes_to_add) != 0) {
-				malloc_header->lock = false;
-				errno = ENOMEM;
-				return NULL;
-			}
-			smallest_block->length += bytes_to_add;
-			malloc_header->pages += bytes_to_add / PAGE_SIZE;
-			size_t old_length = smallest_block->length;
-			smallest_block->length = aligned_size;
-			smallest_block->in_use = true;
-			size_t remaining_size = old_length - smallest_block->length - align_up(sizeof(area));
-			add_new_trailing_block(remaining_size);
-			malloc_header->blocks += 1;
-		}
-	}
-	malloc_header->lock = false;
-	return (void *)((char *) smallest_block + align_up(sizeof(area)));
+	return best;
 }
 
-void reduce_heap_size_if_possible(void) {
-	area *last_block = find_last_block();
-	if (last_block->in_use) return;
-
-	area* prev_used_block = find_previous_used_block(last_block);
+static area *find_block_from_payload(void *ptr) {
 	my_stats *malloc_header = get_malloc_header();
-
-	if (!prev_used_block) {
-		size_t required_header_size = align_up(sizeof(my_stats)) + align_up(sizeof(area));
-		size_t required_payload_size = PAGE_SIZE - required_header_size;
-
-		size_t bytes_to_reduce = (last_block->length + align_up(sizeof(area)) + align_up(sizeof(my_stats))) - PAGE_SIZE;
-		if (sbrk_step(-(ssize_t)bytes_to_reduce) != 0) {
-			errno = ENOMEM;
-			return;
-		}
-		last_block -> length = required_payload_size;
-		malloc_header->blocks = 1;
-		malloc_header->pages = 1;
-		return;
-	}
-	else {
-		size_t reducible = last_block->length;
-		size_t bytes_to_reduce = (reducible / PAGE_SIZE) * PAGE_SIZE;
-		
-		if (sbrk_step((ssize_t)-bytes_to_reduce) != 0) {
-			errno = ENOMEM;
-			return;
-		}
-
-		last_block->length -= bytes_to_reduce;
-		size_t pages_released = bytes_to_reduce / PAGE_SIZE;
-		malloc_header->pages -= pages_released;
-		return;
-	}
-}
-
-void *an_malloc(ssize_t size) {
-	if (size <= 0) return NULL;
-	if (heap_start == NULL) {
-		heap_start = sbrk_return_current_break();
-		if (heap_start == NULL || sbrk_step(4096) != 0) {
-			heap_start = NULL;
-			return NULL;
-		}
-	}
-	char *heap_end = sbrk_return_current_break();
-	if (heap_end == NULL) {
-		heap_start = NULL;
-		return NULL;
-	}
-	long int length = heap_end - heap_start;
-	if (!allocator_initialized) {
-		my_stats *malloc_header = (my_stats *)heap_start;
-		malloc_header->init_marker = INIT_MARKER;
-		malloc_header->lock = false;
-		malloc_header->blocks = malloc_header->pages = 1;
-
-		area *first_block = (area *)(heap_start + align_up(sizeof(my_stats)));
-		first_block->in_use = false;
-		first_block->length = length - align_up(sizeof(my_stats)) - align_up(sizeof(area));
-		first_block->marker = BLOCK_MARKER;
-		first_block->prev = first_block->next = NULL;
-
-		allocator_initialized = true;
-	}
-	return add_used_block_best_fit(size);
-}
-
-area *find_block_from_payload(void *ptr) {
-	my_stats *malloc_header = get_malloc_header();
-	area *temp = (area *)((char *)malloc_header + align_up(sizeof(my_stats)));
+	area *temp = (area *)((char *)malloc_header + stats_size());
 	while (temp) {
-		void *payload = (char *)temp + align_up(sizeof(area));
-		if (payload == ptr) return temp;
+		if (payload_of(temp) == ptr) return temp;
 		temp = temp->next;
 	}
 	return NULL;
 }
 
-bool an_free(void *ptr) {
-	if (!ptr) {
+static void absorb_next_free_block(area *block, my_stats* malloc_header) {
+	area *next_free_block = block->next;
+	block->length += header_size() + next_free_block->length;
+	block->next = next_free_block->next;
+	if (next_free_block->next) next_free_block->next->prev = block;
+	malloc_header->blocks -= 1;
+}
+
+static void split_block(area *block, size_t aligned_size, my_stats *malloc_header) {
+	size_t leftover_size = block->length - aligned_size;
+	if (leftover_size >= header_size() + MIN_PAYLOAD) {
+		area *new_block = (area *)((char *)block + header_size() + aligned_size);
+		new_block->in_use = false;
+		new_block->length = leftover_size - header_size();
+		new_block->marker = BLOCK_MARKER;
+		new_block->next = block->next;
+		new_block->prev = block;
+		if (new_block->next) new_block->next->prev = new_block;
+		block->next = new_block;
+		block->length = aligned_size;
+		malloc_header->blocks += 1;
+		if (new_block->next && !new_block->next->in_use) absorb_next_free_block(new_block, malloc_header);
+	}
+}
+
+static bool grow_tail(area* last_block, size_t required_size, my_stats *malloc_header) {
+	if (last_block->length >= required_size) return true;
+	size_t deficit = required_size - last_block->length;
+	size_t bytes_to_add = align_page_up(deficit);
+	if (bytes_to_add == 0 || 
+		bytes_to_add > (size_t)SSIZE_MAX || 
+		last_block->length > SIZE_MAX - bytes_to_add ||
+		sbrk_step(bytes_to_add) != 0) {
+		errno = ENOMEM;
 		return false;
 	}
+	last_block->length += bytes_to_add;
+	malloc_header->pages += bytes_to_add / PAGE_SIZE;
+	return true;
+}
+
+static void reduce_heap_size_if_possible(void) {
+	my_stats *malloc_header = get_malloc_header();
+	area *last_block = find_last_block();
+	if (last_block->in_use) return;
+	size_t pages_to_reduce = last_block->length / PAGE_SIZE;
+	size_t bytes_to_reduce = pages_to_reduce * PAGE_SIZE;
+	if (sbrk_step(-(ssize_t)bytes_to_reduce) != 0) {
+		errno = ENOMEM;
+		return;
+	}
+	last_block->length -= bytes_to_reduce;
+	malloc_header->pages -= pages_to_reduce;
+}
+
+static bool initialize_heap(void) {
+	char *start = sbrk_return_current_break();
+	if (!start || sbrk_step(PAGE_SIZE) != 0) return false;
+	heap_start = start;
+	my_stats *malloc_header = (my_stats *)heap_start;
+	malloc_header->init_marker = INIT_MARKER;
+	malloc_header->lock = false;
+	malloc_header->blocks = malloc_header->pages = 1;
+	area *first_block = (area *)((char *)malloc_header + stats_size());
+	first_block->in_use = false;
+	first_block->length = PAGE_SIZE - stats_size() - header_size();
+	first_block->marker = BLOCK_MARKER;
+	first_block->prev = first_block->next = NULL;
+	allocator_initialized = true;
+	return true;
+}
+
+static void *add_block(size_t size) {
 	my_stats *malloc_header = get_malloc_header();
 	while(malloc_header->lock) sleep(1);
-	malloc_header->lock = true;
-
-	area *block = find_block_from_payload(ptr);
-	if (!block || block->marker != BLOCK_MARKER) {
-		malloc_header->lock = false;
-		return false;
+	size_t aligned_size = align_up(size);
+	if (aligned_size == 0) {
+		errno = ENOMEM;
+		return NULL;
 	}
+	malloc_header->lock = true;
+	area *best_block = find_best_fit(aligned_size);
+	if (!best_block) best_block = find_last_block();
+	if (!best_block->next) {
+		size_t overhead = header_size() + MIN_PAYLOAD;
+		size_t required_size = aligned_size + overhead;
+		if (aligned_size > SIZE_MAX - overhead || !grow_tail(best_block, required_size, malloc_header)) {
+			malloc_header->lock = false;
+			errno = ENOMEM;
+			return NULL;
+		}
+	}
+	best_block->in_use = true;
+	split_block(best_block, aligned_size, malloc_header);
+	malloc_header->lock = false;
+	return payload_of(best_block);
+}
 
-	if (!block->in_use) {
+void *an_malloc(ssize_t size) {
+	if (size <= 0) return NULL;
+	if (!allocator_initialized && !initialize_heap()) {
+		FATAL("FATAL: heap not initialized.\n");
+	}
+	return add_block((size_t)size);
+}
+
+bool an_free(void *ptr) {
+	if (!ptr) return false;
+	my_stats *malloc_header = get_malloc_header();
+	while (malloc_header->lock) sleep(1);
+	malloc_header->lock = true;
+	area *block = find_block_from_payload(ptr);
+	if (!block || block->marker != BLOCK_MARKER || !block->in_use) {
 		malloc_header->lock = false;
 		return false;
 	}
 	block->in_use = false;
-	if (block->next && !(block->next)->in_use) {
-		area *not_used_next_block = block->next;
-		if (not_used_next_block) {
-			block->next = not_used_next_block->next;
-			if (not_used_next_block->next) not_used_next_block->next->prev = block;
-			else block->next = NULL;
-		}
-		block->length += align_up(sizeof(area)) + not_used_next_block->length;
-		malloc_header->blocks -= 1;
-	}
-	if (block-> prev && !(block->prev)->in_use) {
-		area *to_delete_block = block;
+	if (block->next && !block->next->in_use)
+		absorb_next_free_block(block, malloc_header);
+	if (block->prev && !block->prev->in_use) {
 		block = block->prev;
-		block->length += align_up(sizeof(area)) + to_delete_block->length;
-		block->next = to_delete_block->next;
-		if (block->next) block->next->prev = block;
-		malloc_header->blocks -= 1;
+		absorb_next_free_block(block, malloc_header);
 	}
 	reduce_heap_size_if_possible();
 	malloc_header->lock = false;
@@ -375,95 +265,57 @@ void *an_realloc(void *ptr, ssize_t size) {
 		return NULL;
 	}
 	my_stats *malloc_header = get_malloc_header();
-	while(malloc_header->lock) sleep(1);
+	while (malloc_header->lock) sleep(1);
 	malloc_header->lock = true;
-	area* block = find_block_from_payload(ptr);
-	if (!block || !block->in_use || block->marker != BLOCK_MARKER) {
+	area *block = find_block_from_payload(ptr);
+	if (!block || block->marker != BLOCK_MARKER || !block->in_use) {
 		malloc_header->lock = false;
 		errno = EINVAL;
-		return NULL;
+		return false;
 	}
 	size_t aligned_size = align_up((size_t)size);
 	if (aligned_size == 0) {
 		malloc_header->lock = false;
 		errno = ENOMEM;
-		return NULL;
+		return false;
 	}
 	if (aligned_size == block->length) {
 		malloc_header->lock = false;
 		return ptr;
 	}
-
-	//shrink
 	if (aligned_size < block->length) {
-		size_t leftover_size = block->length - aligned_size;
-		if (leftover_size >= align_up(sizeof(area)) + MIN_PAYLOAD) {
-			area *new_block = (area *)((char *)block + align_up(sizeof(area)) + aligned_size);
-			new_block->in_use = false;
-			new_block->length = leftover_size - align_up(sizeof(area));
-			new_block->marker = BLOCK_MARKER;
-			new_block->next = block->next;
-			new_block->prev = block;
-			if (new_block->next) new_block->next->prev = new_block;
-			block->next = new_block;
-			block->length = aligned_size;
-			malloc_header->blocks += 1;
-
-			if (new_block->next && !new_block->next->in_use) {
-				area *n = new_block->next;
-				new_block->length += align_up(sizeof(area)) + n->length;
-				new_block->next = n->next;
-				if (n->next) n->next->prev = new_block;
-				malloc_header->blocks -= 1;
-			}
-		}
+		split_block(block, aligned_size, malloc_header);
 		reduce_heap_size_if_possible();
 		malloc_header->lock = false;
 		return ptr;
 	}
-	//grow
 	area *next_block = block->next;
 	if (next_block && !next_block->in_use) {
-		size_t total = block->length + align_up(sizeof(area)) + next_block->length;
+		size_t total = block->length + header_size() + next_block->length;
 		size_t need = 0;
 		if (next_block->next) need = aligned_size;
-		else need = aligned_size + align_up(sizeof(area)) + MIN_PAYLOAD;
+		else need = aligned_size + header_size() + MIN_PAYLOAD;
 		if (total >= need) {
-			block->next = next_block->next;
-			if (next_block->next) next_block->next->prev = block;
-			block->length = total;
-			malloc_header->blocks -= 1;
-			size_t leftover_size = block->length - aligned_size;
-			if (leftover_size >= align_up(sizeof(area)) + MIN_PAYLOAD) {
-				area *new_block = (area *)((char *)block + align_up(sizeof(area)) + aligned_size);
-				new_block->in_use = false;
-				new_block->length = leftover_size - align_up(sizeof(area));
-				new_block->marker = BLOCK_MARKER;
-				new_block->next = block->next;
-				new_block->prev = block;
-				if (new_block->next) new_block->next->prev = new_block;
-				block->next = new_block;
-				block->length = aligned_size;
-				malloc_header->blocks += 1;
-			}
+			absorb_next_free_block(block, malloc_header);
+			split_block(block, aligned_size, malloc_header);
 			malloc_header->lock = false;
 			return ptr;
 		}
 	}
 	malloc_header->lock = false;
-	void *fresh = an_malloc(size);
-	if (!fresh) return NULL;
-	memcpy(fresh, ptr, block->length);
+	void *fresh_new_block = an_malloc(size);
+	if (!fresh_new_block) return NULL;
+	memcpy(fresh_new_block, ptr, block->length);
 	an_free(ptr);
-	return fresh;
+	return fresh_new_block;
 }
 
-void *an_calloc(size_t nmofele, size_t size) {
-	if (nmofele != 0 && size > SIZE_MAX / nmofele) {
+void *an_calloc(size_t nmemb, size_t size) {
+	if (nmemb != 0 && size > SIZE_MAX / nmemb) {
 		errno = ENOMEM;
 		return NULL;
 	}
-	size_t total = size * nmofele;
+	size_t total = size * nmemb;
 	if (total > SSIZE_MAX) {
 		errno = ENOMEM;
 		return NULL;
