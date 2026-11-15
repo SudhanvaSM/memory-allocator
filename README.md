@@ -1,72 +1,59 @@
 # Memory Allocator
 
-A small C allocator built around the Unix `sbrk()` interface. It implements a custom heap manager with a doubly linked list of blocks, page-based growth, coalescing, and a best-fit allocation strategy.
+An educational C memory allocator built on the Unix `sbrk()` interface. It manages a custom heap using a doubly linked list of blocks, page-based growth, coalescing, and a best-fit allocation strategy.
 
-> Status: This project is educational and intentionally small. It is not a production allocator and should not be mixed with libc `malloc` or other code that changes the process break in the same process.
+> **Status:** This is a learning project, not a production allocator. It changes the process break, so do not mix it with libc allocation or other code that uses `sbrk()` in the same process.
 
-## Design goals and decisions
+## Design decisions
 
-This allocator keeps a very specific heap layout so allocation logic stays simple and predictable:
+- **Keep the tail block free.** The final heap block is maintained as free, so when no other free block fits a request the allocator can grow that tail directly rather than adding a separate empty block.
+- **Prefer lower addresses on best-fit ties.** The best-fit search replaces its current candidate only when it finds a strictly smaller fitting block. Equal-size candidates therefore keep the earlier (lower-address) block.
+- **Coalesce adjacent free blocks.** Freeing a block merges it with free neighbors. Whole pages at the heap end can then be returned to the system when possible.
 
-- The final block in the heap is always kept free. This means allocation does not need a separate "is the last block free?" branch: if no other free block matches, the allocator can grow the tail block directly instead of creating an extra temporary free block.
-- Best-fit uses a strict `>` tie-break on block length, so when two blocks are the same size, the lower-address block wins. This keeps allocations clustered toward the beginning of the heap and helps preserve the tail invariant.
-- Free blocks are coalesced with adjacent neighbors when possible, and entire whole-page regions at the end of the heap are released back with `sbrk()` when safe.
+## Repository layout
 
-## Files
+```text
+include/mem_alloc.h       Public allocator API
+src/mem_alloc.c           Allocator implementation
+tests/test_mem_alloc.c    Test suite
+Makefile                  Build, test, and cleanup targets
+```
 
-- `mem_alloc.c` — allocator implementation.
-- `mem_alloc.h` — public API header for the allocator.
-- `test_mem_alloc.c` — validation and regression suite.
+## API
 
-## Public interface
-
-The allocator exposes the following API in `mem_alloc.h`:
+Include `mem_alloc.h` to use the allocator:
 
 ```c
+#include "mem_alloc.h"
+
 void *an_malloc(ssize_t size);
 bool  an_free(void *ptr);
 void *an_realloc(void *ptr, ssize_t size);
 void *an_calloc(size_t nmemb, size_t size);
 ```
 
-Notes:
-
-- `an_malloc(size)` allocates `size` bytes and returns a pointer, or `NULL` on failure.
-- `an_free(ptr)` frees an allocation returned by this allocator.
-- `an_realloc(ptr, size)` follows glibc-style semantics and may resize in place or move the allocation.
-- `an_calloc(nmemb, size)` allocates and zero-initializes memory with overflow checking.
+- `an_malloc` allocates a block; non-positive sizes return `NULL`.
+- `an_free` releases an allocator-owned block and returns whether it succeeded.
+- `an_realloc` resizes a block, in place when possible, and otherwise may move it.
+- `an_calloc` allocates zero-initialized memory and checks multiplication overflow.
 
 ## Build and test
 
-From the repository root:
+The Makefile uses GCC by default. From the repository root:
 
 ```sh
-mkdir -p bin
-cc -g -O0 -Wall -o bin/test_mem_alloc test_mem_alloc.c
-./bin/test_mem_alloc
+make          # build the test executable at bin/test_mem_alloc
+make test     # build and run the test suite
+make lib      # build object/libmem_alloc.a
+make check    # build the library, run tests, and rerun tests at -O2
+make clean    # remove generated bin/ and object/ directories
 ```
 
-Useful test options:
+The test harness runs cases in child processes and checks allocator invariants, allocation and freeing behavior, and stress scenarios. It includes the allocator source directly so it can inspect internal heap state; the test executable should not also link the static library.
 
-```sh
-./bin/test_mem_alloc -l           # list available tests
-./bin/test_mem_alloc coalesce     # run tests whose names contain "coalesce"
-```
+## Requirements and limitations
 
-The test suite includes invariant checks after each operation and runs each case in a forked child process so failures are isolated and reported cleanly.
-
-## Requirements
-
-This project expects a POSIX-like environment with:
-
-- `sbrk()` support
-- `fork()` / `waitpid()`
-- `setrlimit()` for the OOM tests
-
-The project is intended for Linux-like systems and is not portable to environments that lack a process heap break API.
-
-## Important limitations
-
-- This allocator changes the process break with `sbrk()`. Do not mix it with libc allocation functions in the same process.
-- It is a single-threaded allocator and is not meant to be a full replacement for a production memory allocator.
-- The implementation is intentionally minimal and educational, with explicit heap invariants and test coverage designed to validate behavior.
+- A GCC-compatible compiler and GNU Make.
+- A POSIX-like system with `sbrk()`, `fork()`/`waitpid()`, and `setrlimit()` support. Some environments may not support all tests or `sbrk()`.
+- The allocator is intended for single-threaded educational use. Do not treat its internal lock as production-grade thread synchronization.
+- Avoid libc allocation calls after the allocator initializes: libc or other libraries may change the program break and interfere with this allocator.
