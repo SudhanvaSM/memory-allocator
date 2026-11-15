@@ -27,6 +27,7 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 
 #ifndef ALLOCATOR_SRC
 #define ALLOCATOR_SRC "mem_alloc.c"
