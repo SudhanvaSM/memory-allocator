@@ -1,4 +1,4 @@
-#include "mem_alloc.h"
+#include "../include/mem_alloc.h"
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -11,8 +11,8 @@
 
 #define ALIGNMENT _Alignof(max_align_t)
 #define PAGE_SIZE 4096
-#define INIT_MARKER 0x55
-#define BLOCK_MARKER 0xDD
+#define INIT_MARKER 0x55			// Mark start of heap. Arbitrary value
+#define BLOCK_MARKER 0xDD			// Validation check for blocks
 #define MIN_PAYLOAD ((size_t)16)
 
 // Global header stats
@@ -356,7 +356,7 @@ void *an_calloc(size_t nmemb, size_t size) {
 }
 
 // Debug helper: print the block list starting at `head`. 
-void display_ll(area *head) {
+static void display_ll(area *head) {
 	printf("Linked List: ");
 	for (; head; head = head->next)
 		printf("%zu (%s) -> ", head->length, head->in_use ? "USED" : "FREE");

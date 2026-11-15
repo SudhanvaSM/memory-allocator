@@ -30,7 +30,7 @@
 #include <sys/wait.h>
 
 #ifndef ALLOCATOR_SRC
-#define ALLOCATOR_SRC "mem_alloc.c"
+#define ALLOCATOR_SRC "../src/mem_alloc.c"
 #endif
 
 /* realloc/calloc tests run by default. To test an allocator that lacks them, build with
